@@ -75,6 +75,28 @@ int8_t nextSample()
     return output;
 }
 
+void TaskSquareWave(void *pvParameters)
+{
+    const int TEST_PIN = 7;
+    pinMode(TEST_PIN, OUTPUT);
+    
+    (void) pvParameters;
+
+    for (;;) // A Task shall never return or exit.
+    {
+        digitalWrite(TEST_PIN, HIGH);   // turn the LED on (HIGH is the voltage level)
+        vTaskDelay( 5 / portTICK_PERIOD_MS ); // wait for one second
+        digitalWrite(TEST_PIN, LOW);    // turn the LED off by making the voltage LOW
+        vTaskDelay( 5 / portTICK_PERIOD_MS ); // wait for one second
+    }
+}
+
+void taskAddToBuffer(void  *pvParameters)
+{
+    pcmAddSample(nextSample());
+}
+
+
 void setup()
 {
     pinMode(LED_BUILTIN, OUTPUT);
@@ -85,13 +107,29 @@ void setup()
     // Oscillator.
     squarewv_ = SquareWv(SQUARE_NO_ALIAS_2048_DATA);
     sawtooth_ = SquareWv(SAW2048_DATA);
-    setNoteHz(110.0);
+    setNoteHz(440.0);
+
+
+    xTaskCreate(
+        taskAddToBuffer
+        ,  "AddToBuffer"
+        ,  128
+        ,  NULL
+        ,  2 
+        ,  NULL );
+
+    xTaskCreate(
+        TaskSquareWave
+        ,  "SquareWave"
+        ,  128
+        ,  NULL
+        ,  1  
+        ,  NULL );
 
     pcmSetup();
 
     Serial.println("Synth prototype ready");
 }
-
 void loop()
 {    
 
