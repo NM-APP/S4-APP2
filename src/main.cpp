@@ -1,11 +1,13 @@
 #include <Arduino.h>
 #include <Arduino_FreeRTOS.h>
 #include <queue.h>
+#include <event_groups.h>
 #include <Oscil.h>
 #include <tables/saw2048_int8.h>
 #include <tables/square_no_alias_2048_int8.h>
 
 #include "pcm_audio.hpp"
+#include "song.hpp"
 
 /*
 
@@ -22,6 +24,10 @@ mais je suis nul avec FreeRTOS... Bonne chance!
 using Sawtooth = Oscil<SAW2048_NUM_CELLS, SAMPLE_RATE>;
 using SquareWv = Oscil<SQUARE_NO_ALIAS_2048_NUM_CELLS, SAMPLE_RATE>;
 
+int16_t b1;
+int16_t a1;
+int16_t a2;
+
 #define PIN_SW1 2  // note fixe
 #define PIN_SW2 3  // mélodie
 #define PIN_RV1 A0 // tempo
@@ -36,6 +42,10 @@ QueueHandle_t tempoQueue;
 QueueHandle_t VCADurationQueue;
 QueueHandle_t VCFCutQueue;
 QueueHandle_t VCFResonanceQueue;
+QueueHandle_t SW1Queue;
+QueueHandle_t SW2Queue;
+
+EventGroupHandle_t buttonEventGroup;
 
 void setNoteHz(float note)
 {
@@ -43,19 +53,37 @@ void setNoteHz(float note)
     sawtooth_.setFreq(note);
 }
 
+int8_t processVCA(int8_t input)
+{
+    static float amplitude_factor = 0.0f;
+    static float amplitude_diminution = 0.0f;
+    static float duree_VCA;
+    bool isSW1;
+    bool isSW2;
+
+    xQueuePeek(SW1Queue, &isSW1, eNoAction);
+    xQueuePeek(SW2Queue, &isSW2, eNoAction);
+    xQueuePeek(VCADurationQueue, &duree_VCA, eNoAction);
+
+    if (isSW1 || isSW2)
+    {
+        amplitude_factor = 1.0;
+        amplitude_diminution = 1.0 / (duree_VCA * SAMPLE_RATE);
+    }
+    else if (amplitude_factor > 0.0)
+    {
+        amplitude_factor -= amplitude_diminution;
+        if (amplitude_factor < 0.0)
+        {
+            amplitude_factor = 0.0;
+        }
+    }
+
+    return input * amplitude_factor;
+}
+
 int8_t processVCF(int8_t input)
 {
-    float f; // Coupure
-    float q; // Résonnance
-
-    xQueuePeek(VCFCutQueue, &f, portMAX_DELAY);
-    xQueuePeek(VCFResonanceQueue, &q, portMAX_DELAY);
-
-    float fb = (q + (q / (1.0 - f)));
-    int16_t b1 = f * f * 256;
-    int16_t a1 = (2 - 2 * f + f * fb - f * f * fb) * 256;
-    int16_t a2 = -(1 - 2 * f + f * fb + f * f - f * f * fb) * 256;
-
     static int8_t y1 = 0;
     static int8_t y2 = 0;
 
@@ -71,24 +99,59 @@ int8_t processVCF(int8_t input)
 
 int8_t nextSample()
 {
-    // VCO
     int8_t vco = sawtooth_.next() + squarewv_.next();
-
-    // VCF (disabled)
     int8_t vcf = processVCF(vco);
-
-    // VCA (disabled)
-    int8_t vca = vcf;
+    int8_t vca = processVCA(vcf);
 
     int8_t output = vca;
 
     return output;
 }
 
+void Sequencer()
+{
+    static int i = 0;
+    static int j = 0;
+    int8_t songLength = sizeof(song) / sizeof(song[0]);
+    bool SW2;
+    float tempo;
+
+    xQueuePeek(SW2Queue, &SW2, eNoAction);
+    xQueuePeek(tempoQueue, &tempo, eNoAction);
+
+    if (SW2)
+    {
+        if (i < songLength)
+        {
+            if (j < song[i].duration * (60.0f * 250.0f) / tempo)
+            {
+                setNoteHz(song[i].freq);
+                j++;
+            }
+            else
+            {
+                i++;
+                j = 0;
+            }
+        }
+        else
+        {
+            i = 0;
+            j = 1;
+            setNoteHz(song[i].freq);
+        }
+    }
+    else
+    {
+        setNoteHz(400.0f);
+    }
+}
+
 void taskAddToBuffer(void *pvParameters)
 {
     for (;;)
     {
+        Sequencer();
         if (pcmBufferFull() == false)
         {
             pcmAddSample(nextSample());
@@ -121,44 +184,77 @@ void readPotentiometer(void *pvParameters)
         xQueueOverwrite(VCFCutQueue, &VCFCutValue);
         xQueueOverwrite(VCFResonanceQueue, &VCFResonanceValue);
 
+        float f = VCFCutValue;
+        float q = VCFResonanceValue;
+
+        float fb = (q + (q / (1.0 - f)));
+        b1 = f * f * 256;
+        a1 = (2 - 2 * f + f * fb - f * f * fb) * 256;
+        a2 = -(1 - 2 * f + f * fb + f * f - f * f * fb) * 256;
+
         vTaskDelay(100 / portTICK_PERIOD_MS);
     }
 }
 
 void isrSW1()
 {
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    bool sw1State = digitalRead(PIN_SW1);
+    xQueueOverwriteFromISR(SW1Queue, &sw1State, &xHigherPriorityTaskWoken);
 
+    if (xHigherPriorityTaskWoken == pdTRUE)
+    {
+        portYIELD_FROM_ISR();
+    }
 }
 
 void isrSW2()
 {
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    bool sw2State = digitalRead(PIN_SW2);
+    xQueueOverwriteFromISR(SW2Queue, &sw2State, &xHigherPriorityTaskWoken);
 
+    if (xHigherPriorityTaskWoken == pdTRUE)
+    {
+        portYIELD_FROM_ISR();
+    }
 }
 
 void setup()
 {
     pinMode(LED_BUILTIN, OUTPUT);
     pinMode(PIN_SW1, INPUT);
+    pinMode(PIN_SW2, INPUT);
 
-    attachInterrupt(digitalPinToInterrupt(PIN_SW1), isrSW1, eNoAction);
-    attachInterrupt(digitalPinToInterrupt(PIN_SW2), isrSW2, eNoAction);
+    attachInterrupt(digitalPinToInterrupt(PIN_SW1), isrSW1, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(PIN_SW2), isrSW2, CHANGE);
+
+    buttonEventGroup = xEventGroupCreate();
 
     Serial.begin(9600);
+
     tempoQueue = xQueueCreate(1, sizeof(float));
     VCADurationQueue = xQueueCreate(1, sizeof(float));
     VCFCutQueue = xQueueCreate(1, sizeof(float));
     VCFResonanceQueue = xQueueCreate(1, sizeof(float));
+    SW1Queue = xQueueCreate(1, sizeof(bool));
+    SW2Queue = xQueueCreate(1, sizeof(bool));
+
+    bool initSwitches = false;
+
+    xQueueOverwrite(SW1Queue, &initSwitches);
+    xQueueOverwrite(SW2Queue, &initSwitches);
 
     // Oscillator.
     squarewv_ = SquareWv(SQUARE_NO_ALIAS_2048_DATA);
     sawtooth_ = SquareWv(SAW2048_DATA);
-    setNoteHz(440.0);
+    setNoteHz(164.81);
 
     xTaskCreate(
-        taskAddToBuffer, "AddToBuffer", 128, NULL, 1, NULL);
+        taskAddToBuffer, "AddToBuffer", 256, NULL, 1, NULL);
 
     xTaskCreate(
-        readPotentiometer, "ReadPotentiometer", 128, NULL, 3, NULL);
+        readPotentiometer, "ReadPotentiometer", 256, NULL, 2, NULL);
 
     pcmSetup();
 
