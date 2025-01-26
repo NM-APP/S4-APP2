@@ -69,21 +69,23 @@ int8_t processVCA(int8_t input, bool sw1, bool sw2, float envelopeDuration)
 {
     static float envelopePosition = 0.0f;
     static float decayFactor = 1.0f;
+    static float envelopeStep = 0.0f;
 
     int8_t outputSignal = 0;
 
     if (sw1 || sw2)
     {
         envelopePosition = 0;
+        envelopeStep = 1.0f / envelopeDuration; // Précalculer l'inverse
         outputSignal = input;
     }
     else if (isVCAActive)
     {
-        if (envelopePosition < envelopeDuration)
+        if (envelopePosition < 1.0f) // Normalisation de l'enveloppe (0 à 1)
         {
-            decayFactor = 1.0f - (envelopePosition / envelopeDuration);
+            decayFactor = 1.0f - envelopePosition;
             outputSignal = input * decayFactor;
-            envelopePosition++;
+            envelopePosition += envelopeStep;
         }
         else
         {
@@ -98,6 +100,7 @@ int8_t processVCA(int8_t input, bool sw1, bool sw2, float envelopeDuration)
 
     return outputSignal;
 }
+
 
 int8_t nextSample()
 {
