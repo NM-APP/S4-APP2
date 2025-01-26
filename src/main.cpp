@@ -5,7 +5,6 @@
 #include "song.hpp"
 #include <tables/saw2048_int8.h>
 #include <tables/square_no_alias_2048_int8.h>
-
 #include "pcm_audio.hpp"
 
 /*
@@ -33,20 +32,18 @@ using SquareWv = Oscil<SQUARE_NO_ALIAS_2048_NUM_CELLS, SAMPLE_RATE>;
 SquareWv squarewv_;
 Sawtooth sawtooth_;
 
-float tempoValue;
-float VCADurationValue;
-float VCFCutValue;
-float VCFResonanceValue;
-QueueHandle_t potentiometerQueue;
+bool SW1 = false;
+bool SW2 = false;
 
-bool SW1;
-bool SW2;
+bool isVCAActive = false;
 
-float fb;
-int16_t b1;
-int16_t a1;
-int16_t a2;
-QueueHandle_t filterCoeffQueue;
+typedef struct
+{
+    float potentiometerValues[4];  // Tempo, VCA duration, VCF cut, VCF resonance
+    int16_t filterCoefficients[3]; // b1, a1, a2
+} AudioParams;
+
+QueueHandle_t audioParamsQueue;
 
 void setNoteHz(float note)
 {
@@ -54,27 +51,13 @@ void setNoteHz(float note)
     sawtooth_.setFreq(note);
 }
 
-int8_t processVCF(int8_t input)
+int8_t processVCF(int8_t input, int16_t b1, int16_t a1, int16_t a2)
 {
     static int8_t y1 = 0;
     static int8_t y2 = 0;
 
-    int8_t output = 0;
-
-    // Reduce the time spent in the mutex
-    int16_t local_b1 = 0, local_a1 = 0, local_a2 = 0;
-
-    // Retrieve filter coefficients from the queue
-    int16_t filterCoefficients[3];
-    if (xQueuePeek(filterCoeffQueue, &filterCoefficients, 0) == pdPASS)
-    {
-        local_b1 = filterCoefficients[0];
-        local_a1 = filterCoefficients[1];
-        local_a2 = filterCoefficients[2];
-    }
-
-    int16_t y0 = local_b1 * input + local_a1 * y1 + local_a2 * y2;
-    output = 0xFF & (y0 >> 8);
+    int16_t y0 = b1 * input + a1 * y1 + a2 * y2;
+    int8_t output = 0xFF & (y0 >> 8);
 
     y2 = y1;
     y1 = output;
@@ -82,24 +65,15 @@ int8_t processVCF(int8_t input)
     return output;
 }
 
-int8_t processVCA(int8_t input)
+int8_t processVCA(int8_t input, bool sw1, bool sw2, float envelopeDuration)
 {
-    static bool isVCAActive = false;
-    static float envelopePosition = 0;
+    static float envelopePosition = 0.0f;
+    static float decayFactor = 1.0f;
 
     int8_t outputSignal = 0;
-    float envelopeDuration = 0;
 
-    // Retrieve potentiometer values from the queue
-    float potentiometerValues[4];
-    if (xQueuePeek(potentiometerQueue, &potentiometerValues, 0) == pdPASS)
+    if (sw1 || sw2)
     {
-        envelopeDuration = potentiometerValues[1] * 8000.0f; // Use the VCADurationValue from the queue
-    }
-
-    if (SW1 || SW2)
-    {
-        isVCAActive = true;
         envelopePosition = 0;
         outputSignal = input;
     }
@@ -107,7 +81,7 @@ int8_t processVCA(int8_t input)
     {
         if (envelopePosition < envelopeDuration)
         {
-            float decayFactor = 1.0f - (envelopePosition / envelopeDuration);
+            decayFactor = 1.0f - (envelopePosition / envelopeDuration);
             outputSignal = input * decayFactor;
             envelopePosition++;
         }
@@ -127,27 +101,38 @@ int8_t processVCA(int8_t input)
 
 int8_t nextSample()
 {
+    static int currentNoteIndex = 0;
+    static int currentNoteDuration = 0;
+    static const int songLength = sizeof(song) / sizeof(song[0]);
+
+    AudioParams params;
+
+    if (xQueuePeek(audioParamsQueue, &params, 0) != pdPASS)
+    {
+        return 0; // Return silence if data is unavailable
+    }
+
+    float *potentiometerValues = params.potentiometerValues;
+    int16_t *filterCoefficients = params.filterCoefficients;
+
+    float localTempo = potentiometerValues[0];
+    float envelopeDuration = potentiometerValues[1] * 8000.0f;
+
     if (SW1)
     {
-        setNoteHz(440.0f);
+        squarewv_.setFreq(440.0f);
+        sawtooth_.setFreq(440.0f);
+        isVCAActive = true;
     }
     else if (SW2)
     {
-        float local_tempo;
-        float potentiometerValues[4];
-        if (xQueuePeek(potentiometerQueue, &potentiometerValues, 0) == pdPASS)
-        {
-            local_tempo = potentiometerValues[0];
-        }
-        static int currentNoteIndex = 0;
-        static int currentNoteDuration = 0;
-        static int songLength = sizeof(song) / sizeof(song[0]);
-
+        isVCAActive = true;
         if (currentNoteIndex < songLength)
         {
-            if (currentNoteDuration < song[currentNoteIndex].duration * 250.0f * 60.0f / (local_tempo/2))
+            if (currentNoteDuration < song[currentNoteIndex].duration * 250.0f * 60.0f / (localTempo / 2))
             {
-                setNoteHz(song[currentNoteIndex].freq);
+                squarewv_.setFreq(song[currentNoteIndex].freq);
+                sawtooth_.setFreq(song[currentNoteIndex].freq);
                 currentNoteDuration++;
             }
             else
@@ -160,24 +145,21 @@ int8_t nextSample()
         {
             currentNoteDuration = 0;
             currentNoteIndex = 0;
-            setNoteHz(song[currentNoteIndex].freq);
         }
     }
 
     int8_t vco = sawtooth_.next() + squarewv_.next();
-    int8_t vcf = processVCF(vco);
-    int8_t vca = processVCA(vcf);
+    int8_t vcf = processVCF(vco, filterCoefficients[0], filterCoefficients[1], filterCoefficients[2]);
+    int8_t vca = processVCA(vcf, SW1, SW2, envelopeDuration);
 
-    int8_t output = vca;
-
-    return output;
+    return vca;
 }
 
 void taskAddToBuffer(void *pvParameters)
 {
     for (;;)
     {
-        if (pcmBufferFull() == false)
+        if (!pcmBufferFull())
         {
             pcmAddSample(nextSample());
         }
@@ -192,39 +174,20 @@ void readPotentiometerTask(void *pvParameters __attribute__((unused)))
 {
     for (;;)
     {
-        // Read potentiometer values before placing them in the queue to avoid holding the mutex for long
-        float _tempoValue = (analogRead(PIN_RV1) / 1023.0f) * (240.0 - 60.0f) + 60.0f;
-        float _VCADurationValue = (analogRead(PIN_RV2) / 1023.0f) * PI;
-        float _VCFCutValue = (analogRead(PIN_RV3) / 1023.0f);
-        float _VCFResonanceValue = (analogRead(PIN_RV4) / 1023.0f) * 3.0f;
+        AudioParams params;
 
-        // Store potentiometer values in a temporary array
-        float potentiometerValues[4] = {_tempoValue, _VCADurationValue, _VCFCutValue, _VCFResonanceValue};
+        params.potentiometerValues[0] = (analogRead(PIN_RV1) / 1023.0f) * (240.0 - 60.0f) + 60.0f;
+        params.potentiometerValues[1] = (analogRead(PIN_RV2) / 1023.0f) * PI;
+        params.potentiometerValues[2] = (analogRead(PIN_RV3) / 1023.0f);
+        params.potentiometerValues[3] = (analogRead(PIN_RV4) / 1023.0f) * 3.0f;
 
-        // Send potentiometer values to the potentiometer queue
-        xQueueOverwrite(potentiometerQueue, &potentiometerValues);
+        float fb = params.potentiometerValues[3] + (params.potentiometerValues[3] / (1.0 - params.potentiometerValues[2]));
+        params.filterCoefficients[0] = params.potentiometerValues[2] * params.potentiometerValues[2] * 256;
+        params.filterCoefficients[1] = (2 - 2 * params.potentiometerValues[2] + params.potentiometerValues[2] * fb - params.potentiometerValues[2] * params.potentiometerValues[2] * fb) * 256;
+        params.filterCoefficients[2] = -(1 - 2 * params.potentiometerValues[2] + params.potentiometerValues[2] * fb + params.potentiometerValues[2] * params.potentiometerValues[2] - params.potentiometerValues[2] * params.potentiometerValues[2] * fb) * 256;
 
-        // Calculate the filter coefficients
-        static float f = 0;
-        static float q = 0;
+        xQueueOverwrite(audioParamsQueue, &params);
 
-        // Update filter coefficients based on the potentiometer values
-        f = _VCFCutValue;
-        q = _VCFResonanceValue;
-
-        // Calculate filter coefficients
-        fb = (q + (q / (1.0 - f)));
-        b1 = f * f * 256;
-        a1 = (2 - 2 * f + f * fb - f * f * fb) * 256;
-        a2 = -(1 - 2 * f + f * fb + f * f - f * f * fb) * 256;
-
-        // Store filter coefficients in an array
-        int16_t filterCoefficients[3] = {b1, a1, a2};
-
-        // Send filter coefficients to the filter queue
-        xQueueOverwrite(filterCoeffQueue, &filterCoefficients);
-
-        // Delay to control sampling rate
         vTaskDelay(100 / portTICK_PERIOD_MS);
     }
 }
@@ -232,36 +195,33 @@ void readPotentiometerTask(void *pvParameters __attribute__((unused)))
 void isrSW1()
 {
     SW1 = digitalRead(PIN_SW1);
-    SW2 = 0;
+    SW2 = false;
 }
 
 void isrSW2()
 {
     SW2 = digitalRead(PIN_SW2);
-    SW1 = 0;
+    SW1 = false;
 }
 
 void setup()
 {
     pinMode(LED_BUILTIN, OUTPUT);
     pinMode(PIN_SW1, INPUT);
+    pinMode(PIN_SW2, INPUT);
 
     Serial.begin(9600);
 
     attachInterrupt(digitalPinToInterrupt(PIN_SW1), isrSW1, CHANGE);
     attachInterrupt(digitalPinToInterrupt(PIN_SW2), isrSW2, CHANGE);
 
-    // Oscillator.
     squarewv_ = SquareWv(SQUARE_NO_ALIAS_2048_DATA);
-    sawtooth_ = SquareWv(SAW2048_DATA);
+    sawtooth_ = Sawtooth(SAW2048_DATA);
     setNoteHz(440.0);
 
-    // QUEUES
-    potentiometerQueue = xQueueCreate(1, sizeof(float[4]));
-    filterCoeffQueue = xQueueCreate(1, sizeof(int16_t[3]));
+    audioParamsQueue = xQueueCreate(1, sizeof(AudioParams));
 
-    // TASKS
-    xTaskCreate(readPotentiometerTask, "readPotentiometer", 256, NULL, 2, NULL);
+    xTaskCreate(readPotentiometerTask, "readPotentiometer", 256, NULL, 3, NULL);
     xTaskCreate(taskAddToBuffer, "AddToBuffer", 256, NULL, 1, NULL);
 
     pcmSetup();
@@ -269,6 +229,4 @@ void setup()
     Serial.println("Synth prototype ready");
 }
 
-void loop()
-{
-}
+void loop() {}
