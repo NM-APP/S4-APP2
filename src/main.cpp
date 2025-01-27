@@ -69,6 +69,11 @@ int8_t processVCF(int8_t input, int16_t b1, int16_t a1, int16_t a2)
     return output;
 }
 
+/*
+    Selon le temps VCAduration, on détermine le pas à laquelle on diminue l'input.
+    Ensuite, on multiplie l'input par un decayFactor qui est de 0 à 1 qui est diminuer à chaque iteration.
+*/
+
 int8_t processVCA(int8_t input, bool sw1, bool sw2, float envelopeDuration)
 {
     static float envelopePosition = 0.0f;
