@@ -150,6 +150,11 @@ int8_t nextSample()
             currentNoteIndex = 0;
         }
     }
+    else
+    {
+        currentNoteDuration = 0;
+        currentNoteIndex = 0;
+    }
 
     int8_t vco = sawtooth_.next() + squarewv_.next();
     int8_t vcf = processVCF(vco, filterCoefficients[0], filterCoefficients[1], filterCoefficients[2]);
