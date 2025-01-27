@@ -37,6 +37,10 @@ bool SW2 = false;
 
 bool isVCAActive = false;
 
+/*
+    Pour éviter de faire plusieurs queue correspondant à chaque coefficients et valeur de potentiomètre, nous utilisons une seule Queue contenant une struct.
+*/
+
 typedef struct
 {
     float potentiometerValues[4];  // Tempo, VCA duration, VCF cut, VCF resonance
@@ -101,18 +105,22 @@ int8_t processVCA(int8_t input, bool sw1, bool sw2, float envelopeDuration)
     return outputSignal;
 }
 
-
 int8_t nextSample()
 {
     static int currentNoteIndex = 0;
     static int currentNoteDuration = 0;
     static const int songLength = sizeof(song) / sizeof(song[0]);
 
+    /*
+        Pour optimiser l'ajout de notes dans le buffer, nous avons utilisé une seule queue pour faire un seul xQueuePeek. D'après nos tests,
+        un xQueuePeek() est très coûteux.
+    */
+
     AudioParams params;
 
     if (xQueuePeek(audioParamsQueue, &params, 0) != pdPASS)
     {
-        return 0; // Return silence if data is unavailable
+        return 0; 
     }
 
     float *potentiometerValues = params.potentiometerValues;
@@ -127,12 +135,22 @@ int8_t nextSample()
         sawtooth_.setFreq(440.0f);
         isVCAActive = true;
     }
+
+    /*
+        Ici, on a pris une approche qui maximise le contrôle sur la mélodie, pour ce faire, on met le nombre de notes dans le buffer correspondant à 
+        la durée de chaque note. Par contre, c'est un trade off de performance contre le contrôle. 
+        
+        On a dû optimisé le code davantage pour atteindre les requis et les performances voulu. Nous aurions pu faire une tâche qui, avec un délai correspondant à
+        la durée du temps, ajouterait les fréquences dans le buffer.
+
+        Dans l'optique où c'est un produit qui serait destiné à des musiciens, on devrait prioriser la précision des mélodies.
+    */
     else if (SW2)
     {
         isVCAActive = true;
         if (currentNoteIndex < songLength)
         {
-            if (currentNoteDuration < song[currentNoteIndex].duration * 250.0f * 60.0f / (localTempo / 2))
+            if (currentNoteDuration < song[currentNoteIndex].duration * 250.0f * 60.0f / (localTempo/2))
             {
                 squarewv_.setFreq(song[currentNoteIndex].freq);
                 sawtooth_.setFreq(song[currentNoteIndex].freq);
@@ -156,6 +174,10 @@ int8_t nextSample()
         currentNoteIndex = 0;
     }
 
+    /*
+        Pour évité de devoir accèder à la queue encore dans les fonctions processVCF et processVCA, on passe les variable contenue dans la struct
+        directement en paramètre.
+    */
     int8_t vco = sawtooth_.next() + squarewv_.next();
     int8_t vcf = processVCF(vco, filterCoefficients[0], filterCoefficients[1], filterCoefficients[2]);
     int8_t vca = processVCA(vcf, SW1, SW2, envelopeDuration);
@@ -178,8 +200,19 @@ void taskAddToBuffer(void *pvParameters)
     }
 }
 
+
+/*
+    Cette tâche s'effectue à 10Hz, donc on mets les valeurs analogues des potentiomètres et les coefficients de filtre dans une structure
+    qu'on met dans une seule xQueue.
+*/
 void readPotentiometerTask(void *pvParameters __attribute__((unused)))
 {
+
+    TickType_t xLastWakeTime;
+    const TickType_t xFrequency = 10;
+
+    xLastWakeTime = xTaskGetTickCount();
+
     for (;;)
     {
         AudioParams params;
@@ -196,9 +229,17 @@ void readPotentiometerTask(void *pvParameters __attribute__((unused)))
 
         xQueueOverwrite(audioParamsQueue, &params);
 
-        vTaskDelay(100 / portTICK_PERIOD_MS);
+        vTaskDelayUntil(&xLastWakeTime, xFrequency);
     }
 }
+
+/*
+    Nous avons utilisé des ISR pour éviter d'avoir une tâche qui lit les valeurs des boutons en permanence ce qui, évidamment,
+    ne serait pas optimale.
+
+    Comme nous programmons un synthetiseur et non une fusée qui va dans l'espace, les variables d'états des boutons
+    sont des variables globales non "thread-safe". Dans notre cas, c'est assez réactif et nous facilite beaucoup l'implémentation.
+*/
 
 void isrSW1()
 {
@@ -229,6 +270,12 @@ void setup()
 
     audioParamsQueue = xQueueCreate(1, sizeof(AudioParams));
 
+    /*
+        Pour simplifier l'implémentation et évité le plus de task switching possible, nous avons utilisé seulement 2 tasks.
+        Nous priorisons la tâche de lecture du potentiomètre comme celle-ci s'effectue à 10hz et l'autre beaucoup plus rapidement, 
+        donc on s'assure que la lecture des potentiomètre se fasse à tout les 100 ms.
+        
+    */
     xTaskCreate(readPotentiometerTask, "readPotentiometer", 256, NULL, 3, NULL);
     xTaskCreate(taskAddToBuffer, "AddToBuffer", 256, NULL, 1, NULL);
 
